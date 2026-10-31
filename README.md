@@ -30,19 +30,41 @@ default, so nothing is actually using the GPU yet.
 All POST routes take `-F` or `--data` form fields.
 
 ```shell
-curl -s -X POST --data "url=https://example.com/" https://chromium.dev.initialed85.cc/render
+curl -s -H "authorization: Bearer $TOKEN" -X POST --data "url=https://example.com/" https://chromium.dev.initialed85.cc/render
 
-curl -s -X POST --data "url=https://example.com/" https://chromium.dev.initialed85.cc/screenshot -o shot.png
+curl -s -H "authorization: Bearer $TOKEN" -X POST --data "url=https://example.com/" https://chromium.dev.initialed85.cc/screenshot -o shot.png
 
-curl -s -X POST --data "url=https://example.com/" \
+curl -s -H "authorization: Bearer $TOKEN" -X POST --data "url=https://example.com/" \
   --data-urlencode "expression=document.title" https://chromium.dev.initialed85.cc/eval
 
 # CDP discovery, then connect to the returned wss:// URL
-curl -s https://chromium.dev.initialed85.cc/json/version
+curl -s -H "authorization: Bearer $TOKEN" https://chromium.dev.initialed85.cc/json/version
 ```
 
 For a CDP client, take the `webSocketDebuggerUrl` from `/json/version` as-is — it
 is rewritten to `wss://chromium.dev.initialed85.cc/cdp/devtools/browser/<id>`.
+
+## Auth
+
+The public host is bearer-token gated (2026-10-31): Traefik's `Middleware
+auth-api-tokens@kubernetescrd` calls `deployment/token-gate` in namespace `auth` (source:
+`~/Projects/Home/token-gate`), which answers 204 for a matching token and 401 for everything
+else. **A 401 is the gate, not this service being down** — that distinction costs an hour of
+diagnosis if the docs do not say it.
+
+```shell
+TOKEN=$(kubectl --context home-dev -n auth get secret api-tokens \
+          -o jsonpath='{.data.API_TOKEN_EDWARD}' | base64 -d)
+curl -s -H "authorization: Bearer $TOKEN" https://chromium.dev.initialed85.cc/healthz
+```
+
+The gate runs before this binary, so nothing here parses tokens, and the caller's
+`authorization` header arrives in our request headers untouched (do not log it). Websocket
+handshakes are gated the same way — measured on the real CDP endpoint: no credential → `401`,
+`authorization: Bearer …` on the upgrade → `101`, `?token=` on the URL → `101`, wrong token →
+`401`. websocat takes it as `--header="authorization: Bearer $TOKEN"` (equal-sign form, after
+the address; websocat warns that a bare `-H` swallows following arguments). Local runs
+(`BASE_URL=http://127.0.0.1:8080 ./validate.sh`) have no gate, no token.
 
 ## Two things that bite
 
