@@ -66,7 +66,7 @@ handshakes are gated the same way — measured on the real CDP endpoint: no cred
 the address; websocat warns that a bare `-H` swallows following arguments). Local runs
 (`BASE_URL=http://127.0.0.1:8080 ./validate.sh`) have no gate, no token.
 
-## Two things that bite
+## Things that bite
 
 - Chrome rejects a CDP request whose `Host` header is not an IP or localhost, and
   rejects a websocket upgrade from a non-localhost origin. The proxy rewrites the
@@ -82,6 +82,23 @@ the address; websocat warns that a bare `-H` swallows following arguments). Loca
   this binary (PID 1) and Go never `wait()`s them, so every request leaves about
   five `[defunct]` processes behind. Don't put a timeout on the context that
   first allocates the browser.
+- An unreachable target looks like a success from the CDP side. Chrome serves its
+  net-internals error page **under the target URL**, so a tab for that host exists
+  in `/json/list` and `Runtime.evaluate` answers on it. Ask the page: the
+  discriminator is `document.documentURI`, which is `chrome-error://chromewebdata/`
+  (measured, for NXDOMAIN and for connection-refused). A caller that checks only
+  "tab exists" and "evaluate answered" will file a bug against this service for its
+  own dead DNS.
+- Send CDP messages in one batch per websocket. Rapid sequential reconnects to the
+  same page target get rejected and the message disappears without an error - with
+  websocat that means piping several messages into one connection and matching
+  replies by `id` (measured: nav, probe and evaluate on three sockets left the
+  evaluate answering nothing; probe+evaluate on one socket was clean).
+- Tabs are a budget: a navigation spends its tab, `/json/close` is not proxied, and
+  each open websocket holds one of `MAX_CONCURRENT` slots, so a client that does not
+  close what it opened (with `Target.closeTarget`, on the failure paths too) leaks
+  tabs and slots. Count tabs before and after a run, sampling **before** you acquire
+  a tab, and prove the scale with a keep-the-tab control run once.
 
 ## One browser, many tabs
 
