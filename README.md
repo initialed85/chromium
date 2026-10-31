@@ -51,9 +51,24 @@ is rewritten to `wss://chromium.dev.initialed85.cc/cdp/devtools/browser/<id>`.
   Host and the browser runs with `--remote-allow-origins=*`, so connecting through
   the ingress works. Connecting straight to the loopback CDP port from outside the
   pod does not.
-- The browser is allocated once on a long-lived context. Per-request contexts are
-  children of it, so a request timeout closes a tab, not the browser. Don't put a
-  timeout on the context that first allocates the browser.
+- The browser is allocated once on a long-lived context. Per-request tabs must be
+  children of *that* context, and `tab()` derives them from `cfg.browserCtx` (the
+  context that has run and so owns the browser). A chromedp context whose parent
+  has no browser yet allocates its own headless shell, so parenting a tab on the
+  request's own context launches a second browser per request: chromedp waits the
+  browser, but its zygotes, gpu-process, utility and renderer are reparented to
+  this binary (PID 1) and Go never `wait()`s them, so every request leaves about
+  five `[defunct]` processes behind. Don't put a timeout on the context that
+  first allocates the browser.
+
+## One browser, many tabs
+
+Every request renders in its own tab of the one browser, so the tabs share that
+browser's cookies, localStorage and HTTP cache: write from one `/eval` and the
+next request reads it back. Live tabs are visible in `/json/list` while a request
+is in flight, and they are closed when it finishes. Isolating requests needs
+`chromedp.WithNewBrowserContext` per tab plus `target.DisposeBrowserContext` on
+cancel; not worth it here.
 
 Concurrency is capped at `MAX_CONCURRENT` (default 4); over that you get 429. Per
 request timeout is `REQUEST_TIMEOUT_SECONDS` (default 30).
@@ -62,6 +77,23 @@ request timeout is `REQUEST_TIMEOUT_SECONDS` (default 30).
 
 Screenshot through chromium, read it back through `ocr.dev.initialed85.cc` — that's
 the cheapest way to assert that a page actually rendered.
+
+## Watch the processes
+
+The pod has no `ps`. Count the defunct processes in it (`Z` in the third field of
+`/proc/<pid>/stat`); steady state is 0. A steady climb means a browser is being
+launched per request again.
+
+```shell
+POD=$(kubectl --context home-dev -n chromium get pods | tail -n +2 | awk '{print $1}')
+kubectl --context home-dev -n chromium exec $POD -- sh -c '
+  for p in /proc/[0-9]*; do set -- $(cat $p/stat 2>/dev/null); [ "$3" = Z ] && echo "$1"; done | wc -l'
+```
+
+The steady set is six live `headless-shell` processes under this binary (PID 1):
+the browser, two zygotes, `--type=gpu-process`, one `--type=utility` service, and
+one `--type=renderer` for the boot `about:blank` tab; a render adds a renderer of
+its own while it runs.
 
 ## Validate
 

@@ -29,6 +29,7 @@ type config struct {
 	maxConcurrent int
 	version       string
 	startedAt     time.Time
+	browserCtx    context.Context
 
 	mu       sync.Mutex
 	requests int
@@ -68,9 +69,11 @@ func main() {
 
 	bootCtx, bootCancel := chromedp.NewContext(allocCtx)
 	defer bootCancel()
+	// Run gives bootCtx the browser, and every tab below inherits it.
 	if _, err := chromedp.Run(bootCtx, chromedp.Title()); err != nil {
 		log.Fatalf("could not start browser at %s: %v", cfg.execPath, err)
 	}
+	cfg.browserCtx = bootCtx
 	log.Printf("browser ready (%s, cdp 127.0.0.1:%s)", cfg.version, cfg.cdpPort)
 
 	mux := http.NewServeMux()
@@ -135,8 +138,17 @@ func (c *config) tab(r *http.Request) (context.Context, context.CancelFunc, erro
 		return nil, nil, fmt.Errorf("post 'url' with an absolute http or https url")
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), c.timeout)
+	// The tab must be a child of the context that owns the browser. The request's
+	// own context is not one, and a chromedp context whose parent has no browser
+	// yet allocates a browser of its own: that second headless shell per request
+	// leaks its zygotes, gpu-process, utility and renderer as defunct processes,
+	// because they are reparented to this binary (PID 1) and Go never waits them.
+	ctx, cancel := context.WithTimeout(c.browserCtx, c.timeout)
 	tabCtx, cancelTab := chromedp.NewContext(ctx)
+
+	// Nothing in the tab's chain listens to the request, so a client that hangs
+	// up cancels nothing on its own; close the tab when the request ends.
+	context.AfterFunc(r.Context(), func() { cancelTab() })
 
 	return tabCtx, func() {
 		cancelTab()
