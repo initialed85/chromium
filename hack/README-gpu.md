@@ -1,16 +1,19 @@
 # Drawing on the GPU in this container
 
 `hack/` is the harness behind the "Drawing" section of the README. It exists because every
-statement in that section is something that had to be measured in the pod, and because the
-failure modes all look like "no GPU" from the outside.
+statement in that section is something that had to be measured in the pod, and because all of
+the failure modes look identical from the outside: "no GL context".
 
 Everything below was measured on `home-dev`, node `hermes` (RTX 2080 Ti, driver 595.99.02,
-docker 29.9.2 with the NVIDIA container toolkit and a CDI spec at `/var/run/cdi/nvidia.yaml`).
+docker 29.9.2 with the NVIDIA container toolkit and a CDI spec at `/var/run/cdi/nvidia.yaml`),
+in `chromedp/headless-shell` (Chrome 157, ANGLE on Vulkan, Vulkan loader 1.4.365 bundled at
+`/headless-shell/libvulkan.so.1`).
 
 ## The probe pod
 
 `gpu-probe-pod.yaml` is a throwaway pod on hermes running the service image, with the GPU
-handed to it. It is not part of the service; delete it when the experiment is over.
+handed to it and an Xvfb sidecar. It is not part of the service; delete it when the experiment
+is over.
 
 ```shell
 kubectl --context home-dev apply -f hack/gpu-probe-pod.yaml
@@ -44,62 +47,109 @@ kubectl --context home-dev -n chromium exec gpu-probe -- bash -c \
 ```
 
 `CHROME_FLAGS` is parsed the way the service parses `CHROME_EXTRA_FLAGS`. `CHROME_URL` picks
-the page and `CHROME_REPEAT` runs a timed screenshot loop for the timing comparisons. The
-answer that matters is `UNMASKED_RENDERER_WEBGL`, which names the ANGLE backend and the
-device behind it.
+the page and `CHROME_REPEAT` runs a timed screenshot loop for the software/hardware
+comparison. The answer that matters is `UNMASKED_RENDERER_WEBGL`, which names the ANGLE backend
+and the device behind it.
 
 Two traps in the probe itself, both of which produced a wrong answer before they were fixed:
 a canvas can only ever have one context type, so asking one canvas for `webgl` and then for
-`webgl2` reports `null context` for `webgl2` even when the GPU is right; and a `null` here
-means "no context", not "software", so a broken GPU backend and a missing GPU look identical
-until you also print the renderer string.
+`webgl2` reports `null context` for `webgl2` even when the GPU is right; and `null` here means
+"no context", not "software", so a broken GPU backend and a missing GPU look identical until
+you also print the renderer string.
+
+chromedp swallows the browser's stderr. For the ANGLE and Vulkan-loader diagnostics below,
+run the shell directly with `VK_LOADER_DEBUG=all` and read the stderr yourself.
+
+## Which ICDs are visible, and why it decides everything
+
+`vulkaninfo` prints an *instance* extension block before it prints any device. That block is
+what ANGLE checks, and it is the union of whatever the visible ICDs advertise:
+
+```shell
+VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json vulkaninfo | sed -n '1,40p'
+#   Instance Extensions: count = 24        # no VK_EXT_headless_surface in there
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json vulkaninfo | sed -n '1,40p'
+#   Instance Extensions: count = 18        # VK_EXT_headless_surface present
+```
+
+and the same, from Chrome's side:
+
+```shell
+VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json CHROME_FLAGS="--use-angle=vulkan" /gpucheck
+#   "webgl": "null context"
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json CHROME_FLAGS="--use-angle=vulkan" /gpucheck
+#   "webgl": "null context"
+# both visible:
+#   "ANGLE (NVIDIA, Vulkan 1.4.329 (NVIDIA GeForce RTX 2080 Ti (0x00001E07)), NVIDIA)"
+```
+
+which is the whole story of this investigation. The error ANGLE produces when only the NVIDIA
+ICD is visible is unambiguous but easy to skim past:
+
+```
+ERROR:ui/gl/angle_platform_impl.cc:34] vk_renderer.cpp:265 (VerifyExtensionsPresent):
+  Extension not supported: VK_EXT_headless_surface
+ERROR:ui/gl/angle_platform_impl.cc:34] Display.cpp:1506 (initialize): ANGLE Display::initialize
+  error 0: Internal Vulkan error (-7): A requested extension is not supported,
+  in ../../third_party/angle/src/libANGLE/renderer/vulkan/vk_renderer.cpp, enableInstanceExtensions:2477
+ERROR:ui/gl/gl_display.cc:613] eglInitialize Vulkan failed with error EGL_NOT_INITIALIZED
+```
+
+NVIDIA never advertises that extension per device — on the host and in the container,
+`grep headless_surface` over a full `vulkaninfo` hits exactly one line, in the instance block,
+and the NVIDIA device block (lines 355–2162) does not contain it. Mesa's lavapipe does
+advertise it, so installing `mesa-vulkan-drivers` makes the instance creation succeed, ANGLE
+then ranks the discrete GPU above the CPU device, and every frame is drawn on the card. Neither
+ICD works on its own: lavapipe alone gives Chrome no context either. Chrome's own bundled
+`/headless-shell/vk_swiftshader_icd.json` advertises the extension too and gives no context in
+combination with NVIDIA, measured with and without `--enable-unsafe-swiftshader`, so "the
+extension is present at instance level" is necessary and not sufficient.
 
 ## What was measured
 
-| flags | DISPLAY | WebGL renderer | aquarium screenshot |
+All rows in the service pod (`chromium-*` on hermes) or in `gpu-probe`, `DISPLAY=:99` from the
+xvfb sidecar unless the row says otherwise.
+
+| what was present | flags | WebGL renderer | aquarium screenshot |
 |---|---|---|---|
-| none | unset | `ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero)), SwiftShader driver)` | 451–677 ms |
-| `--enable-gpu` | unset | **no context** | — |
-| `--enable-gpu --use-angle=vulkan` | unset | **no context** | — |
-| `--use-angle=vulkan` | `:99` (Xvfb) | `ANGLE (NVIDIA, Vulkan 1.4.329 (NVIDIA GeForce RTX 2080 Ti (0x00001E07)), NVIDIA)` | 193–218 ms |
-| `--enable-gpu --use-angle=vulkan` | `:99` (Xvfb) | same | 193–218 ms |
-| `--enable-gpu --use-angle=gl` | `:99` (Xvfb) | **no context** | — |
-| `--enable-gpu --use-angle=vulkan` | `:0`, nothing behind it | **no context** | — |
+| nothing (no GPU limit) | none | SwiftShader | — |
+| NVIDIA ICD, no X client libs | none | SwiftShader | — |
+| + X client libs, no display | `--enable-gpu --use-angle=vulkan` | **no context** | — |
+| + display, no `mesa-vulkan-drivers` | `--enable-gpu --use-angle=vulkan` | **no context**, `VK_EXT_headless_surface` unsupported | — |
+| + display, `VK_DRIVER_FILES=nvidia_icd.json` only | `--use-angle=vulkan` | **no context** | — |
+| + display, `VK_DRIVER_FILES=lvp_icd.json` only | `--use-angle=vulkan` | **no context** | — |
+| + display, `VK_DRIVER_FILES=nvidia+swiftshader` | `--use-angle=vulkan`, ±`--enable-unsafe-swiftshader` | **no context** | — |
+| **display + NVIDIA ICD + lavapipe** | `--enable-gpu --use-angle=vulkan` | `ANGLE (NVIDIA, Vulkan 1.4.329 (NVIDIA GeForce RTX 2080 Ti (0x00001E07)), NVIDIA)` | 177–228 ms, mean **190 ms** |
+| same | `--use-angle=vulkan` | same | same |
+| same | `--use-angle=vulkan --ozone-platform=x11` | same | — |
+| same | `--use-angle=gl`, `--use-gl=egl`, `--use-gl=desktop` | **no context** | — |
+| display + NVIDIA ICD + lavapipe | none | `ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero)), SwiftShader driver)` | 362–527 ms, mean **427 ms** |
 
-Alongside those: `vulkaninfo --summary` in the container with the X client libs installed and
-no `DISPLAY` ends with only `llvmpipe`, and the loader error
-
-```
-ERROR: loader_scanned_icd_add: Could not get 'vkCreateInstance' via
-'vk_icdGetInstanceProcAddr' for ICD libGLX_nvidia.so.0
-```
-
-Set `DISPLAY` to a live Xvfb socket and the same command reports `NVIDIA GeForce RTX 2080 Ti`
-at `apiVersion 1.4.329`. Disabling the NVIDIA implicit layer (`VK_LOADER_LAYERS_DISABLE`)
-changes nothing, so the layer is not the culprit — the display connection is. On the host,
-where there is no X server either, the ICD does enumerate headless; the difference is inside
-the container, and the practical rule is simply: **give the container a display**.
-
-VRAM while rendering is what settles "is the card actually being used". Sample
-`nvidia-smi --query-gpu=utilization.gpu,memory.used` on hermes during a `CHROME_REPEAT=10`
-run and the pod's footprint moves 3957 → 4134 MiB on the Vulkan runs and stays flat on the
-SwiftShader ones. `nvidia-smi --query-compute-apps` never lists `headless-shell`, because a
-Vulkan client is not a compute client.
+`--ozone-platform=x11` makes no difference, and neither does `--enable-gpu` once a display and
+the extension exist: `--use-angle=vulkan` alone decides it. VRAM is what settles whether the
+card is really being used: sample `nvidia-smi --query-gpu=utilization.gpu,memory.used` on hermes
+during a `CHROME_REPEAT=8` run and the pod's footprint moves 3957 → 4134 MiB on the Vulkan rows
+and stays flat on the SwiftShader ones. `nvidia-smi --query-compute-apps` never lists
+`headless-shell`, because a Vulkan client is not a compute client — that is expected, not a sign
+of failure.
 
 ## The recipe that worked
 
-Three parts, and the image only covers two of them.
+Four parts. The image covers three of them, the deployment covers the fourth.
 
 1. Hand the container the GPU: `nvidia.com/gpu: "1"` in `limits`,
-   `NVIDIA_DRIVER_CAPABILITIES: "all"`.
-2. Ship the X client libs, which the Dockerfile does: `libx11-6 libxext6 libxcb1 libx11-xcb1`.
-   The image also installs `xvfb` so the same image can run the X server sidecar without a
-   second image to build.
-3. Run a display server in the pod and point `DISPLAY` at it. The deployment in home-ops
-   `clusters/dev/applications/chromium/deployment.yaml` does it as a native sidecar plus an
-   init container that waits for the socket, because the browser is allocated once at boot:
-   a browser that starts before the display exists keeps a display-less GL for its whole
-   life.
+   `NVIDIA_DRIVER_CAPABILITIES: "all"`. Without "all" the toolkit mounts compute libraries
+   only and there is no ICD to be found at all.
+2. Ship the X client libs: `libx11-6 libxext6 libxcb1 libx11-xcb1`. `libGLX_nvidia.so.0`
+   dlopens them before it will export a Vulkan entry point.
+3. Ship `mesa-vulkan-drivers`, for lavapipe's `VK_EXT_headless_surface`. See the section
+   above; nothing else in that package is used.
+4. Run a display server in the pod and point `DISPLAY` at it — still required once 1–3 are in
+   place (measured: `env -u DISPLAY` with everything else correct gives no context). The
+   deployment in home-ops `clusters/dev/applications/chromium/deployment.yaml` does it as a
+   native sidecar plus an init container that waits for the socket, because the browser is
+   allocated once at boot: a browser that starts before the display exists keeps a
+   display-less GL for its whole life.
 
 ```yaml
       initContainers:
@@ -130,16 +180,22 @@ Three parts, and the image only covers two of them.
 ```
 
 `-ac` opens the socket to any local client — the socket only exists inside this pod's
-emptyDir — and `-nolisten tcp` keeps it off the network.
+emptyDir — and `-nolisten tcp` keeps it off the network. `xvfb` ships in the service image so
+the sidecar does not need a second image to build.
 
 ## Not chased further
 
 - **WebGPU**: `navigator.gpu` is missing from this headless shell with software GL and with
   hardware GL alike, so Dawn is not in the build or is not enabled in headless. Untested
   whether a flag would bring it in.
-- **`--use-angle=gl`** (ANGLE on native EGL/GLX): no context, with or without a display.
-  NVIDIA's EGL does not offer a headless platform here and there is no reason to fight for it
-  when Vulkan works.
-- **AMD**: `edward-desktop` renders Vulkan fine (`radv`) and Mesa does implement
-  `VK_EXT_headless_surface`, so an AMD node may need no X server at all. Not measured in a
-  container, and `hermes` is where the `gpu-size: medium` label points.
+- **Native EGL/GLX** (`--use-angle=gl`, `--use-gl=egl`, `--use-gl=desktop`): no context, with
+  or without a display. NVIDIA's EGL does not offer a headless platform here and there is no
+  reason to fight for it when Vulkan works.
+- **AMD**: `edward-desktop` renders Vulkan fine (`radv`) and Mesa implements
+  `VK_EXT_headless_surface` in its drivers, so an AMD node may need neither a display nor a
+  second ICD. Not measured in a container, and `gpu-size: medium` points at hermes.
+- **A shorter ICD list than pulling all of mesa.** `VK_DRIVER_FILES` could name just
+  `nvidia_icd.json` and `lvp_icd.json`, which is tidier than shipping intel/radeon/nouveau
+  ICDs that sit inert. Not done: the flags the service passes are simpler to reason about than
+  an env var whose absence silently changes the backend, and it has not been measured whether
+  the loader honours `VK_DRIVER_FILES` the same way through Chrome's bundled loader.

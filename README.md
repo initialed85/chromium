@@ -120,15 +120,16 @@ nothing else. WebGL works, and in a *headless shell* it works without
 `WEBGL_debug_renderer_info` answers `ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device
 (Subzero) (0x0000C0DE)), SwiftShader driver)`.
 
-`CHROME_EXTRA_FLAGS="--enable-gpu --use-angle=vulkan"` asks for the GPU. On hermes
-(RTX 2080 Ti, driver 595.99.02) that measured **193–218 ms** per screenshot of
-`webglsamples.org/aquarium` against **451–677 ms** for SwiftShader, and the pod's footprint
-on the card went 3957 → 4134 MiB while rendering — that jump is the part which proves the
-card was really used rather than ANGLE merely claiming it was. `GET /` answers
-`gl_renderer`, and the boot log says `drawing with …`, for the same reason.
+`CHROME_EXTRA_FLAGS="--enable-gpu --use-angle=vulkan"` asks for the GPU. In the pod on hermes
+(RTX 2080 Ti, driver 595.99.02), 8 screenshots of `webglsamples.org/aquarium` measured
+**177–228 ms, mean 190 ms** with those flags against **362–527 ms, mean 427 ms** with
+`CHROME_EXTRA_FLAGS` unset, and the pod's footprint on the card went 3957 → 4134 MiB while
+rendering — that jump is the part which proves the card was really used rather than ANGLE
+merely claiming it was. `GET /` answers `gl_renderer`, and the boot log says `drawing with …`,
+for the same reason.
 
-Three things have to be true before ANGLE will take an NVIDIA card, all of them measured
-in `hack/gpucheck` (see `hack/README-gpu.md`):
+Four things have to be true before ANGLE will take an NVIDIA card, all of them measured in
+`hack/gpucheck` (see `hack/README-gpu.md`):
 
 1. The container has to be handed the GPU — `nvidia.com/gpu` in `resources.limits` and
    `NVIDIA_DRIVER_CAPABILITIES: "all"`.
@@ -138,9 +139,22 @@ in `hack/gpucheck` (see `hack/README-gpu.md`):
    'vk_icdGetInstanceProcAddr' for ICD libGLX_nvidia.so.0`, and ANGLE is left holding
    llvmpipe.
 3. There has to be a display to *open*. `DISPLAY=:99` with nothing behind it fails the way
-   the previous item does, and NVIDIA's ICD does not implement `VK_EXT_headless_surface`,
-   so the no-X shortcut Intel and AMD get does not apply here. Hence the `xvfb` sidecar in
-   the home-ops deployment, sharing `/tmp/.X11-unix` through an emptyDir.
+   the previous item does, and it still fails once everything else below is in place, so the
+   no-X shortcut Intel and AMD get does not apply here. Hence the `xvfb` sidecar in the
+   home-ops deployment, sharing `/tmp/.X11-unix` through an emptyDir.
+4. Something in the container has to advertise `VK_EXT_headless_surface` **to the Vulkan
+   loader as an instance extension**, because that is what ANGLE asks for and it refuses to
+   initialise without it. NVIDIA never advertises it: `vulkaninfo` lists it once, in the
+   instance block, and never inside the NVIDIA device block. Pointing `VK_DRIVER_FILES` at
+   `nvidia_icd.json` alone gives 24 instance extensions, none of them that one, and
+   `--use-angle=vulkan` gives no GL context; add `/usr/share/vulkan/icd.d/lvp_icd.json`
+   (Mesa's lavapipe, from `mesa-vulkan-drivers`, which the Dockerfile installs) and the same
+   flags give `ANGLE (NVIDIA, Vulkan 1.4.329, RTX 2080 Ti)` — the extension comes from the
+   software device and ANGLE then picks the discrete GPU as the device to draw with. Chrome's
+   own bundled `vk_swiftshader_icd.json` advertises the extension and does not help; that
+   pair still produces no context. So a software Vulkan device is load-bearing here even
+   though every frame is drawn on the card, which is worth knowing before anyone trims the
+   image.
 
 Once a display exists `--use-angle=vulkan` alone is enough; `--enable-gpu` is along for
 explicitness. Chrome keeps the **first** copy of a repeated switch — measured,
