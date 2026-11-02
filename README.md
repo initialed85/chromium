@@ -123,10 +123,13 @@ nothing else. WebGL works, and in a *headless shell* it works without
 `CHROME_EXTRA_FLAGS="--enable-gpu --use-angle=vulkan"` asks for the GPU. In the pod on hermes
 (RTX 2080 Ti, driver 595.99.02), 8 screenshots of `webglsamples.org/aquarium` measured
 **177–228 ms, mean 190 ms** with those flags against **362–527 ms, mean 427 ms** with
-`CHROME_EXTRA_FLAGS` unset, and the pod's footprint on the card went 3957 → 4134 MiB while
-rendering — that jump is the part which proves the card was really used rather than ANGLE
-merely claiming it was. `GET /` answers `gl_renderer`, and the boot log says `drawing with …`,
-for the same reason.
+`CHROME_EXTRA_FLAGS` unset. Those are per-screenshot inside one warmed tab; at the API, where a
+request also allocates a tab and navigates, the same page measured **0.78–0.98 s** on the GPU pod
+against **1.88–3.41 s** on an identical pod with the flags empty — about 2.3x — while
+`example.com` measured the same **0.14–0.25 s** either way. `nvidia-smi --query-compute-apps`
+lists the pod's `headless-shell --type=gpu-process … --use-angle=vulkan` at 30 MiB, which is the
+proof that the card is really in use rather than ANGLE merely claiming it was. `GET /` answers
+`gl_renderer`, and the boot log says `drawing with …`, for the same reason.
 
 Four things have to be true before ANGLE will take an NVIDIA card, all of them measured in
 `hack/gpucheck` (see `hack/README-gpu.md`):

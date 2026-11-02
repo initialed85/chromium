@@ -126,12 +126,45 @@ xvfb sidecar unless the row says otherwise.
 | display + NVIDIA ICD + lavapipe | none | `ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero)), SwiftShader driver)` | 362–527 ms, mean **427 ms** |
 
 `--ozone-platform=x11` makes no difference, and neither does `--enable-gpu` once a display and
-the extension exist: `--use-angle=vulkan` alone decides it. VRAM is what settles whether the
-card is really being used: sample `nvidia-smi --query-gpu=utilization.gpu,memory.used` on hermes
-during a `CHROME_REPEAT=8` run and the pod's footprint moves 3957 → 4134 MiB on the Vulkan rows
-and stays flat on the SwiftShader ones. `nvidia-smi --query-compute-apps` never lists
-`headless-shell`, because a Vulkan client is not a compute client — that is expected, not a sign
-of failure.
+the extension exist: `--use-angle=vulkan` alone decides it. `nvidia-smi` is what settles whether
+the card is really being used, and the clean read is the process table rather than the gauge:
+with `--enable-gpu` in play `nvidia-smi --query-compute-apps=process_name,used_memory` lists
+`/headless-shell/headless-shell --type=gpu-process … --use-angle=vulkan --enable-gpu` at 30 MiB,
+and it lists nothing like that for a SwiftShader pod. Utilisation is harder to catch, because a
+190 ms render is over long before a 2 s sample lands: six samples during 12 concurrent aquarium
+screenshots peaked at 8%, and the pod's footprint on the card moved 3957 → 4134 MiB across a
+`CHROME_REPEAT=8` run.
+
+## At the API, which is the number that actually matters to a caller
+
+The gpucheck loop reuses one warmed tab and takes screenshots in it, which is the right way to
+compare backends and the wrong number to quote to a caller. A request allocates a tab and
+navigates, so it is dominated by the page. Measured by running a second copy of the same image
+(`1aa2641c0182`) on hermes with `CHROME_EXTRA_FLAGS=""` and no `nvidia.com/gpu` limit, and
+alternating requests against both from a curl pod:
+
+```yaml
+# the software comparison pod; delete it and its Service when done
+spec:
+  nodeSelector: {kubernetes.io/arch: amd64, desktop-node: "true", gpu-size: "medium"}
+  containers:
+    - name: chromium
+      image: docker.io/initialed85/chromium:<same sha as the deployment>
+      env: [{name: CHROME_EXTRA_FLAGS, value: ""}]
+```
+
+| | GPU pod | same image, software |
+|---|---|---|
+| `POST /screenshot` aquarium, 5 alternating runs | 0.78, 0.80, 0.83, 0.88, 0.98 s | 1.88, 1.92, 2.00, 2.75, 3.41 s |
+| `POST /screenshot` `example.com` | 0.14–0.25 s | 0.14–0.18 s |
+| `POST /eval` `example.com` (`1+1`) | 0.088 s | 0.098 s |
+| 12 parallel aquarium shots (`MAX_CONCURRENT=4`) | ~1.6 s each, nothing refused | |
+| 6 parallel `example.com` shots | 4 at 200, 2 at 429 | |
+| `GET /json/list` after the burst | 1 page tab | 1 page tab |
+
+So: about 2.3x on a WebGL page, and nothing at all on a page with nothing to draw, which is the
+expected shape for a GPU that only shortens the render half. The 429s are the concurrency
+limiter doing its job, and no tab leak survived the burst.
 
 ## The recipe that worked
 
