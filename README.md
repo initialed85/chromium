@@ -112,6 +112,47 @@ cancel; not worth it here.
 Concurrency is capped at `MAX_CONCURRENT` (default 4); over that you get 429. Per
 request timeout is `REQUEST_TIMEOUT_SECONDS` (default 30).
 
+## Drawing: SwiftShader unless told otherwise
+
+With `CHROME_EXTRA_FLAGS` unset the shell draws with ANGLE on SwiftShader and needs
+nothing else. WebGL works, and in a *headless shell* it works without
+`--enable-unsafe-swiftshader` (that deprecation gate is about real Chrome):
+`WEBGL_debug_renderer_info` answers `ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device
+(Subzero) (0x0000C0DE)), SwiftShader driver)`.
+
+`CHROME_EXTRA_FLAGS="--enable-gpu --use-angle=vulkan"` asks for the GPU. On hermes
+(RTX 2080 Ti, driver 595.99.02) that measured **193–218 ms** per screenshot of
+`webglsamples.org/aquarium` against **451–677 ms** for SwiftShader, and the pod's footprint
+on the card went 3957 → 4134 MiB while rendering — that jump is the part which proves the
+card was really used rather than ANGLE merely claiming it was. `GET /` answers
+`gl_renderer`, and the boot log says `drawing with …`, for the same reason.
+
+Three things have to be true before ANGLE will take an NVIDIA card, all of them measured
+in `hack/gpucheck` (see `hack/README-gpu.md`):
+
+1. The container has to be handed the GPU — `nvidia.com/gpu` in `resources.limits` and
+   `NVIDIA_DRIVER_CAPABILITIES: "all"`.
+2. The image needs the X client libs (`libx11-6 libxext6 libxcb1 libx11-xcb1`, installed
+   by the Dockerfile). Without them `libGLX_nvidia.so.0` dlopens but exports no Vulkan
+   entry point, the loader logs `Could not get 'vkCreateInstance' via
+   'vk_icdGetInstanceProcAddr' for ICD libGLX_nvidia.so.0`, and ANGLE is left holding
+   llvmpipe.
+3. There has to be a display to *open*. `DISPLAY=:99` with nothing behind it fails the way
+   the previous item does, and NVIDIA's ICD does not implement `VK_EXT_headless_surface`,
+   so the no-X shortcut Intel and AMD get does not apply here. Hence the `xvfb` sidecar in
+   the home-ops deployment, sharing `/tmp/.X11-unix` through an emptyDir.
+
+Once a display exists `--use-angle=vulkan` alone is enough; `--enable-gpu` is along for
+explicitness. Chrome keeps the **first** copy of a repeated switch — measured,
+`--use-angle=swiftshader --use-angle=vulkan` ends on swiftshader — so extra flags add,
+they never override what this binary already passes.
+
+And if the backend that was asked for produces no GL context at all, `bootBrowser` says so
+and starts a second browser with no extra flags rather than serve pages with dead WebGL:
+a Vulkan backend with no display falls back to nothing, not even with
+`--enable-unsafe-swiftshader` (measured). WebGPU is not in this shell either way —
+`navigator.gpu` is missing with software and hardware GL alike.
+
 ## Pairs with ocr
 
 Screenshot through chromium, read it back through `ocr.dev.initialed85.cc` — that's

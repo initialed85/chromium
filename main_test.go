@@ -66,3 +66,43 @@ func TestCDPJSONForwardsMethodAndRewritesWS(t *testing.T) {
 		t.Fatalf("ws url rewritten: got %q, want %q", v["webSocketDebuggerUrl"], want)
 	}
 }
+
+func TestParseChromeFlags(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want []chromeFlag
+	}{
+		{"", []chromeFlag{}},
+		{"--enable-gpu", []chromeFlag{{name: "enable-gpu", value: ""}}},
+		{"--use-angle=vulkan", []chromeFlag{{name: "use-angle", value: "vulkan"}}},
+		{
+			"  --enable-gpu   --use-angle=vulkan\t--enable-unsafe-swiftshader ",
+			[]chromeFlag{
+				{name: "enable-gpu", value: ""},
+				{name: "use-angle", value: "vulkan"},
+				{name: "enable-unsafe-swiftshader", value: ""},
+			},
+		},
+		{"--no-disabled-features=Foo,Bar", []chromeFlag{{name: "no-disabled-features", value: "Foo,Bar"}}},
+		{"-", []chromeFlag{}},
+	}
+
+	for _, c := range cases {
+		got := parseChromeFlags(c.raw)
+		if len(got) != len(c.want) {
+			t.Fatalf("parseChromeFlags(%q): got %d flags %v, want %d", c.raw, len(got), got, len(c.want))
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("parseChromeFlags(%q): flag %d is %+v, want %+v", c.raw, i, got[i], c.want[i])
+			}
+		}
+		for _, f := range got {
+			// A flag with no value is a switch, not a switch with an empty value;
+			// chromedp only emits `--name` for the first.
+			if f.option() == nil {
+				t.Fatalf("parseChromeFlags(%q): %+v has no allocator option", c.raw, f)
+			}
+		}
+	}
+}

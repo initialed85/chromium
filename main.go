@@ -30,10 +30,62 @@ type config struct {
 	version       string
 	startedAt     time.Time
 	browserCtx    context.Context
+	// glRenderer is what the browser reported for ANGLE at boot. It is logged and
+	// served on GET / because it is the only way to tell a GPU backend that landed
+	// from one that was silently refused.
+	glRenderer string
 
 	mu       sync.Mutex
 	requests int
 	slots    chan struct{}
+}
+
+// rendererProbe asks a page which GL stack ANGLE is drawing with. UNMASKED_RENDERER
+// names the backend and the device behind it, so it distinguishes SwiftShader from
+// a real GPU. Each context type needs a canvas of its own: ask one canvas for webgl
+// and then for webgl2 and the second answer is null, which reads exactly like the
+// GPU being unavailable.
+const rendererProbe = `(() => {
+  for (const type of ['webgl2', 'webgl']) {
+    const gl = document.createElement('canvas').getContext(type);
+    if (!gl) continue;
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    if (!ext) return type + ' without WEBGL_debug_renderer_info';
+    return gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+  }
+  return 'no GL context';
+})()`
+
+// chromeFlag is one switch from CHROME_EXTRA_FLAGS.
+type chromeFlag struct {
+	name  string
+	value string // empty means a bare switch, which is a boolean flag set to true
+}
+
+// parseChromeFlags reads CHROME_EXTRA_FLAGS. Flags are added, not overridden:
+// Chrome keeps the first copy of a repeated switch (measured - `--use-angle=swiftshader
+// --use-angle=vulkan` ends on swiftshader), and every flag this service passes itself
+// comes before these.
+func parseChromeFlags(raw string) []chromeFlag {
+	flags := []chromeFlag{}
+	for _, field := range strings.Fields(raw) {
+		name, value, hasValue := strings.Cut(strings.TrimLeft(field, "-"), "=")
+		if name == "" {
+			continue
+		}
+		if !hasValue {
+			value = ""
+		}
+		flags = append(flags, chromeFlag{name: name, value: value})
+	}
+	return flags
+}
+
+func (f chromeFlag) option() chromedp.ExecAllocatorOption {
+	if f.value == "" {
+		return chromedp.Flag(f.name, true)
+	}
+	return chromedp.Flag(f.name, f.value)
 }
 
 func main() {
@@ -53,28 +105,37 @@ func main() {
 	// Per-request contexts are children of it, so cancelling one closes only its
 	// tab. A timeout on the context that first allocates the browser would kill
 	// the browser itself.
-	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(),
-		chromedp.ExecPath(cfg.execPath),
-		chromedp.NoSandbox,
-		chromedp.Headless,
-		chromedp.Flag("remote-debugging-address", "127.0.0.1"),
-		chromedp.Flag("remote-debugging-port", cfg.cdpPort),
-		// Chrome rejects a websocket upgrade whose Origin is not localhost,
-		// and it rejects a Host header that is not an IP or localhost. Both are
-		// rewritten by the /cdp/ proxy below.
-		chromedp.Flag("remote-allow-origins", "*"),
-		remote.WebSocket,
-	)
-	defer allocCancel()
+	//
+	// CHROME_EXTRA_FLAGS is how the draw backend is chosen, and it is empty by
+	// default: with nothing asked for, the browser draws with SwiftShader and needs
+	// no display. A hardware GPU needs more than flags (hack/README-gpu.md), and the
+	// flags are not evidence that the backend landed - the page is.
+	extra := parseChromeFlags(env("CHROME_EXTRA_FLAGS", ""))
+	if len(extra) > 0 {
+		log.Printf("chrome extra flags: %s", env("CHROME_EXTRA_FLAGS", ""))
+	}
 
-	bootCtx, bootCancel := chromedp.NewContext(allocCtx)
-	defer bootCancel()
-	// Run gives bootCtx the browser, and every tab below inherits it.
-	if _, err := chromedp.Run(bootCtx, chromedp.Title()); err != nil {
+	browserCtx, stopBrowser, renderer, err := bootBrowser(cfg, extra)
+	if err != nil {
 		log.Fatalf("could not start browser at %s: %v", cfg.execPath, err)
 	}
-	cfg.browserCtx = bootCtx
-	log.Printf("browser ready (%s, cdp 127.0.0.1:%s)", cfg.version, cfg.cdpPort)
+	if renderer == noGLContext && len(extra) > 0 {
+		// Measured: a Vulkan backend with no display to open hands back no GL context
+		// at all, and Chrome does not fall back to SwiftShader even with
+		// --enable-unsafe-swiftshader. Pages drawn in software beat pages with dead
+		// WebGL, so drop the extra flags and start a second browser.
+		log.Printf("warning: %q produced %q rather than a GPU, restarting with no extra flags", env("CHROME_EXTRA_FLAGS", ""), renderer)
+		stopBrowser()
+		browserCtx, stopBrowser, renderer, err = bootBrowser(cfg, nil)
+		if err != nil {
+			log.Fatalf("could not start browser at %s: %v", cfg.execPath, err)
+		}
+	}
+	defer stopBrowser()
+
+	cfg.browserCtx = browserCtx
+	cfg.glRenderer = renderer
+	log.Printf("browser ready (%s, cdp 127.0.0.1:%s, drawing with %s)", cfg.version, cfg.cdpPort, renderer)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", cfg.handleIndex)
@@ -93,6 +154,56 @@ func main() {
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// noGLContext is what rendererProbe answers when no canvas got a context at all. It
+// must match the string inside rendererProbe.
+const noGLContext = "no GL context"
+
+// allocOptions is every flag the service passes itself. These come before
+// CHROME_EXTRA_FLAGS, and Chrome keeps the first copy of a repeated switch, so a
+// flag named here cannot be overridden from the environment - it has to be removed
+// here instead.
+func allocOptions(cfg *config) []chromedp.ExecAllocatorOption {
+	return []chromedp.ExecAllocatorOption{
+		chromedp.ExecPath(cfg.execPath),
+		chromedp.NoSandbox,
+		chromedp.Headless,
+		chromedp.Flag("remote-debugging-address", "127.0.0.1"),
+		chromedp.Flag("remote-debugging-port", cfg.cdpPort),
+		// Chrome rejects a websocket upgrade whose Origin is not localhost,
+		// and it rejects a Host header that is not an IP or localhost. Both are
+		// rewritten by the /cdp/ proxy below.
+		chromedp.Flag("remote-allow-origins", "*"),
+		remote.WebSocket,
+	}
+}
+
+// bootBrowser allocates a browser and answers with the context that owns it, the way
+// to shut it down, and what the page says is drawing. Run gives browserCtx the
+// browser, and every tab below inherits it.
+func bootBrowser(cfg *config, extra []chromeFlag) (context.Context, func(), string, error) {
+	opts := allocOptions(cfg)
+	for _, flag := range extra {
+		opts = append(opts, flag.option())
+	}
+	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
+	stop := func() { browserCancel(); allocCancel() }
+
+	if _, err := chromedp.Run(browserCtx, chromedp.Title()); err != nil {
+		stop()
+		return nil, func() {}, "", fmt.Errorf("could not start browser at %s: %w", cfg.execPath, err)
+	}
+
+	renderer, err := chromedp.Run(browserCtx, chromedp.Evaluate[string](rendererProbe))
+	if err != nil {
+		// A browser that answers for Title but not for the probe is still a browser;
+		// the renderer string is diagnostic, not a precondition.
+		log.Printf("could not read the GL renderer: %v", err)
+		renderer = "unknown"
+	}
+	return browserCtx, stop, renderer, nil
 }
 
 func env(key, fallback string) string {
@@ -177,6 +288,7 @@ func (c *config) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"websocket":      c.externalWSBase(r) + "/devtools/browser",
 		"timeout_s":      int(c.timeout.Seconds()),
 		"max_concurrent": c.maxConcurrent,
+		"gl_renderer":    c.glRenderer,
 		"uptime_s":       time.Since(c.startedAt).Seconds(),
 		"requests":       requests,
 	})

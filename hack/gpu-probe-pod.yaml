@@ -1,0 +1,59 @@
+# Throwaway pod on hermes for poking at headless-shell + the NVIDIA stack, with the same
+# two things the service needs: the GPU handed to the container, and a display for the
+# NVIDIA Vulkan ICD to open. Not part of the service; delete it when the experiment is over.
+#
+#   kubectl --context home-dev apply -f hack/gpu-probe-pod.yaml
+#   kubectl --context home-dev -n chromium cp /tmp/gpucheck gpu-probe:/gpucheck
+#   kubectl --context home-dev -n chromium exec gpu-probe -- bash -c \
+#     'CHROME_FLAGS="--enable-gpu --use-angle=vulkan" /gpucheck'
+#
+# See hack/README-gpu.md for what each part is for and what happens if you take it away.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-probe
+  namespace: chromium
+  labels:
+    app: gpu-probe
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/arch: amd64
+    desktop-node: "true"
+    gpu-size: "medium"
+  tolerations:
+    - key: "desktop-node"
+      operator: "Exists"
+      effect: "NoSchedule"
+  initContainers:
+    # A native sidecar: starts before the containers below and stays up. The probe sleeps,
+    # so it does not need the "wait for the socket" init container the Deployment has.
+    - name: xvfb
+      restartPolicy: Always
+      image: docker.io/initialed85/chromium:latest
+      imagePullPolicy: Always
+      command: ["/usr/bin/Xvfb"]
+      args: [":99", "-nolisten", "tcp", "-ac", "-screen", "0", "1280x1024x24"]
+      volumeMounts:
+        - name: x11
+          mountPath: /tmp/.X11-unix
+  containers:
+    - name: probe
+      image: docker.io/initialed85/chromium:latest
+      imagePullPolicy: Always
+      command: ["sleep", "infinity"]
+      env:
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: all
+        - name: DISPLAY
+          value: ":99"
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: x11
+          mountPath: /tmp/.X11-unix
+  volumes:
+    - name: x11
+      emptyDir: {}
