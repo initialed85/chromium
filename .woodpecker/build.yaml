@@ -1,0 +1,69 @@
+# Build, publish, and deploy chromium (home-dev, namespace `chromium`).
+#
+# Multi-stage Dockerfile (golang build stage -> chromedp/headless-shell), so CI does not pre-compile;
+# the `test` step gates the image build. Same contract as rooter/ocr: lint gate in lint.yaml, tests,
+# publish, then stamp the sha into home-ops so Argo rolls the Deployment.
+#
+# Two things to know before "fixing" this file:
+#   1. The runtime base is `chromedp/headless-shell:latest`, a moving tag. `--pull` in the build below
+#      is what keeps a new shell from sitting in the cache forever; pinning the base is the follow-up.
+#   2. The service leaks nothing only because every chromedp context is derived from the browser
+#      context (see repo README / memory). `go test ./...` covers the tab hygiene; the live
+#      end-to-end check is `./validate.sh`, which needs the token-gate credential and so stays manual.
+steps:
+  - name: test
+    image: docker.io/library/golang:1.26
+    commands:
+      - go version
+      - go mod download
+      - test -z "$(gofmt -l .)" || { gofmt -l .; echo "FATAL gofmt - commit the output of gofmt -w ."; exit 1; }
+      - go vet ./...
+      - go test -v -count=1 ./...
+
+  - name: build-and-push
+    image: docker.io/library/docker:cli
+    privileged: true
+    depends_on: [test]
+    environment:
+      DOCKER_HOST: tcp://docker-ocnus-ci-1:2375
+      IMAGE: docker.io/initialed85/chromium
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: dockerhub
+            key: username
+            target:
+              env: DOCKERHUB_USER
+          - name: dockerhub
+            key: token
+            target:
+              env: DOCKERHUB_TOKEN
+    commands:
+      - docker info --format 'daemon={{.Name}}'
+      - echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USER" --password-stdin
+      - docker build --pull --progress=plain --platform=linux/amd64 -t "$IMAGE:$CI_COMMIT_SHA" -t "$IMAGE:latest" .
+      - docker push "$IMAGE:$CI_COMMIT_SHA"
+      - docker push "$IMAGE:latest"
+      - docker inspect --format 'digests={{.RepoDigests}}' "$IMAGE:$CI_COMMIT_SHA"
+
+  - name: deploy-home-ops
+    image: docker.io/initialed85/wp-kustomize-deploy:latest
+    depends_on: [build-and-push]
+    settings:
+      image: docker.io/initialed85/chromium
+      dir: clusters/dev/applications/chromium
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: home-ops-deploy-key
+            key: id_ed25519
+            target:
+              env: PLUGIN_DEPLOY_KEY
+          - name: home-ops-deploy-key
+            key: known_hosts
+            target:
+              env: PLUGIN_KNOWN_HOSTS
+
+when:
+  - event: push
+    branch: master
